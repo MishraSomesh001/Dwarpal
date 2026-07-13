@@ -1,0 +1,20 @@
+# Sensitive Files
+.env
+
+# Go binaries and testing executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+gateway
+main
+
+# Test data
+payload.json
+
+# Local IDE / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
