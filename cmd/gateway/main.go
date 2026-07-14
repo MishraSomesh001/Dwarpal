@@ -10,7 +10,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
-
+	"aegis/internal/cache"
+	"time"
 )
 
 // Load env
@@ -88,6 +89,7 @@ func newOpenAIProxy(apiKey string) (*httputil.ReverseProxy, error) {
 }
 
 func main() {
+	// Loading env variables
 	if err := loadEnv(".env"); err != nil {
     	log.Fatalf("Error loading .env file: %v", err)
 	}
@@ -97,24 +99,34 @@ func main() {
 		log.Fatal("OPENAI_API_KEY not found")
 	}
 
+	// Init postgreDB
 	db, err := database.InitDB()
 	if err != nil {
 		log.Fatalf("Error initializing database: %v", err)
 	}
 	defer db.Close()
 
-
+	//init Redis
+	rdb, err := cache.InitRedis()
+	if err!= nil{
+		log.Fatalf("Error initializing Redis: %v", err)
+	}
+	defer rdb.Close()
 	// Create proxy
 	proxy, err := newOpenAIProxy(apiKey)
 	if err != nil {
 		log.Fatal(err)
 	}
-
+	// proxy Handler
 	proxyHandler:= http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxy.ServeHTTP(w, r)
 	})
+	//Rate Limithandler
+	limiter:= middleware.RateLimitMiddleware(rdb,5,1*time.Minute)
+	rateLimitedHandler := limiter(proxyHandler)
 
-	authedHandler := middleware.AuthMiddleware(db,proxyHandler)
+	// Auth Handler
+	authedHandler := middleware.AuthMiddleware(db,rateLimitedHandler)
 
 	http.Handle("/v1/", authedHandler)
 
