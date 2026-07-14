@@ -1,13 +1,15 @@
 package main
 
 import (
+	"aegis/internal/database"
+	"aegis/internal/middleware"
+	"bufio"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
-	"bufio"
 
 )
 
@@ -95,15 +97,26 @@ func main() {
 		log.Fatal("OPENAI_API_KEY not found")
 	}
 
+	db, err := database.InitDB()
+	if err != nil {
+		log.Fatalf("Error initializing database: %v", err)
+	}
+	defer db.Close()
+
+
 	// Create proxy
 	proxy, err := newOpenAIProxy(apiKey)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	http.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
+	proxyHandler:= http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxy.ServeHTTP(w, r)
 	})
+
+	authedHandler := middleware.AuthMiddleware(db,proxyHandler)
+
+	http.Handle("/v1/", authedHandler)
 
 	log.Println("Proxy running on :8080")
 
