@@ -4,12 +4,20 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"time"
-	_"github.com/lib/pq"
+
+	_ "github.com/lib/pq"
 )
+
+var(
+	ErrInvalidKey = errors.New("Invalid API Key")
+	ErrOutOfBudget = errors.New("Budget limit Exceed")
+)
+
 // Hash imcoming raw key
 func HashKey(key string) string {
 	hash := sha256.Sum256([]byte(key))
@@ -71,7 +79,9 @@ func InitDB() (*sql.DB, error) {
 		tenant_id INTEGER REFERENCES tenants(id),
 		key_hash TEXT NOT NULL UNIQUE,
 		is_active BOOLEAN DEFAULT TRUE,
-		expires_at TIMESTAMP
+		expires_at TIMESTAMP,
+		budget_usd NUMERIC(10, 4) DEFAULT 10.00,
+		spend_usd NUMERIC(10, 4) DEFAULT 0.00
 	);
 	`
 
@@ -105,12 +115,14 @@ func InitDB() (*sql.DB, error) {
 
 		_, err = db.Exec(
 			`INSERT INTO virtual_keys
-			(tenant_id, key_hash, is_active, expires_at)
-			VALUES($1,$2,$3,$4)`,
+			(tenant_id, key_hash, is_active, expires_at, budget_usd, spend_usd)
+			VALUES($1,$2,$3,$4,$5,$6)`,
 			tenantID,
 			hashedKey,
 			true,
 			time.Now().Add(365*24*time.Hour),
+			10.00, // Budget
+			0.00,  // Start Spend at 0
 		)
 
 		if err != nil {
@@ -121,35 +133,55 @@ func InitDB() (*sql.DB, error) {
 	return db, nil
 }
 // Validate virtual key
-func ValidateKey(db *sql.DB, rawKey string) (bool, error) {
+func ValidateKey(db *sql.DB, rawKey string) error {
 
 	hashed := HashKey(rawKey)
 
 	var active bool
 	var expiresAt sql.NullTime
+	var budgetUsd float64
+	var spendUsd float64
 
 	err := db.QueryRow(
-		`SELECT is_active, expires_at
+		`SELECT is_active, expires_at, budget_usd, spend_usd
 		 FROM virtual_keys
 		 WHERE key_hash=$1`,
 		hashed,
-	).Scan(&active, &expiresAt)
+	).Scan(&active, &expiresAt, &budgetUsd, &spendUsd)
 
 	if err == sql.ErrNoRows {
-		return false, nil
+		return ErrInvalidKey
 	}
 
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	if !active {
-		return false, nil
+		return ErrInvalidKey
 	}
 
 	if expiresAt.Valid && time.Now().After(expiresAt.Time) {
-		return false, nil
+		return ErrInvalidKey
 	}
 
-	return true, nil
+	if spendUsd>=budgetUsd {
+		return ErrOutOfBudget
+	}
+
+	return nil
+}
+
+func UpdateKeySpend(db *sql.DB, rawKey string, amount float64) error{
+	hashed := HashKey(rawKey)
+
+	_,err := db.Exec(
+		`UPDATE virtual_keys 
+		 SET spend_usd = spend_usd + $1 
+		 WHERE key_hash = $2`,
+		 amount,
+		 hashed,
+	)
+	return err
+
 }

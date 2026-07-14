@@ -12,7 +12,19 @@ import (
 	"strings"
 	"aegis/internal/cache"
 	"time"
+	"bytes"
+	"encoding/json"
+	"io"
+	"database/sql"
 )
+
+// OpenAI Response Struct
+type OpenAIResponse struct {
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+}
 
 // Load env
 func loadEnv(filepath string) (error){
@@ -60,7 +72,7 @@ func loadEnv(filepath string) (error){
 }
 
 // reverse proxy -> OpenAI
-func newOpenAIProxy(apiKey string) (*httputil.ReverseProxy, error) {
+func newOpenAIProxy(apiKey string, db *sql.DB) (*httputil.ReverseProxy, error) {
 
 	// Parse target URL
 	target, err := url.Parse("https://api.openai.com")
@@ -83,6 +95,55 @@ func newOpenAIProxy(apiKey string) (*httputil.ReverseProxy, error) {
 
 		// Insert OpenAI API key
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	// Modify incoming response
+	proxy.ModifyResponse = func(resp *http.Response) error {
+
+		if resp.StatusCode != http.StatusOK {
+			return nil
+		}
+
+		// Read response body
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("Failed to read response body: %v", err)
+			return nil
+		}
+
+		// Restore body because it can only be read once
+		resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		// Parse JSON response
+		var openAIResp OpenAIResponse
+		if err := json.Unmarshal(bodyBytes, &openAIResp); err != nil {
+			// Ignore responses that don't match OpenAI schema
+			return nil
+		}
+
+		// Retrieve virtual key from request context
+		virtualKey, ok := resp.Request.Context().Value(middleware.VirtualKeyCtxKey).(string)
+		if !ok {
+			log.Println("Virtual key not found in request context")
+			return nil
+		}
+
+		// Pricing for GPT-4o Mini
+		inputCost := float64(openAIResp.Usage.PromptTokens) * 0.00000015
+		outputCost := float64(openAIResp.Usage.CompletionTokens) * 0.00000060
+
+		totalCost := inputCost + outputCost
+
+
+		if totalCost > 0 {
+
+			err := database.UpdateKeySpend(db,virtualKey,totalCost)
+			if err != nil {
+				log.Printf("Failed to update spend: %v", err)
+			}
+		}
+
+		return nil
 	}
 
 	return proxy, nil
@@ -113,7 +174,7 @@ func main() {
 	}
 	defer rdb.Close()
 	// Create proxy
-	proxy, err := newOpenAIProxy(apiKey)
+	proxy, err := newOpenAIProxy(apiKey, db)
 	if err != nil {
 		log.Fatal(err)
 	}

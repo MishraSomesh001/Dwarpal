@@ -1,10 +1,11 @@
 package middleware
 
 import (
-	"context"
 	"aegis/internal/cache"
 	"aegis/internal/database"
+	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -31,16 +32,19 @@ func AuthMiddleware(db *sql.DB, next http.Handler) http.Handler {
         virtualKey := strings.TrimPrefix(authHeader, "Bearer ")
         
         // 4. Validate key with database
-        valid, err := database.ValidateKey(db, virtualKey)
+        err := database.ValidateKey(db, virtualKey)
         if err != nil {
-            log.Printf("Auth middleware database error: %v", err)
-            http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-            return
-        }
-        
-        if !valid {
-            http.Error(w, "Unauthorized: Invalid API key", http.StatusUnauthorized)
-            return
+            if errors.Is(err, database.ErrInvalidKey){
+                http.Error(w, "Unauthorized: Invalid API key", http.StatusUnauthorized)
+                return
+                }
+                if errors.Is(err, database.ErrOutOfBudget){
+                    http.Error(w, "Payment Required: Budget limit exceeded", http.StatusPaymentRequired)
+                    return
+                }
+                log.Printf("Auth middleware database error: %v", err)
+                http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+                return
         }
         
         ctx := context.WithValue(r.Context(), VirtualKeyCtxKey, virtualKey)
