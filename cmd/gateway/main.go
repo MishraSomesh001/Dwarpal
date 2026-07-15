@@ -16,6 +16,9 @@ import (
 	"encoding/json"
 	"io"
 	"database/sql"
+	"aegis/internal/provider"
+	"strconv"
+	"context"
 )
 
 // OpenAI Response Struct
@@ -24,6 +27,14 @@ type OpenAIResponse struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
 	} `json:"usage"`
+}
+
+type contextKey string
+const OriginalBodyKey contextKey = "original_body"
+
+// Model struct
+type RequestModel struct {
+	Model string `json:"model"`
 }
 
 // Load env
@@ -71,30 +82,105 @@ func loadEnv(filepath string) (error){
 	
 }
 
-// reverse proxy -> OpenAI
-func newOpenAIProxy(apiKey string, db *sql.DB) (*httputil.ReverseProxy, error) {
-
-	// Parse target URL
-	target, err := url.Parse("https://api.openai.com")
-	if err != nil {
-		return nil, err
+func peekModel(req *http.Request) (string, []byte, error) {
+	if req.Body == nil {
+		return "", nil, nil
 	}
 
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		return "", nil, err
+	}
+
+	req.Body.Close()
+	req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	var reqModel RequestModel
+	if err := json.Unmarshal(bodyBytes, &reqModel); err != nil {
+		return "", nil, err
+	}
+	return reqModel.Model, bodyBytes, nil
+}
+
+// reverse proxy -> OpenAI
+func newDynamicProxy(apiKey string, geminiKey string, db *sql.DB) (*httputil.ReverseProxy, error) {
+
+	// Parse target URL
+	openAITarget, _ := url.Parse("https://api.openai.com")
+
 	// proxy
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy := httputil.NewSingleHostReverseProxy(openAITarget)
+
+	// Register custom resilience transport
+	proxy.Transport = &AegisTransport{
+		db:        db,
+		apiKey:    apiKey,
+		geminiKey: geminiKey,
+		transport: http.DefaultTransport,
+	}
 
 	// Modify Request
 	proxy.Director = func(req *http.Request) {
+		model, bodyBytes, err := peekModel(req)
+		if err != nil {
+			log.Printf("Failed to peek model: %v", err)
+			return
+		}
 
-		// Forward requests -> OpenAI
+		// Save the original body in the request context so our Transport can access it if it needs to failover
+		ctx := context.WithValue(req.Context(), OriginalBodyKey, bodyBytes)
+		*req = *req.WithContext(ctx)
+
+		// 1. Look up route in PostgreSQL
+		route, err := database.GetModelRoute(db, model)
+		if err != nil {
+			log.Printf("Route not found for model '%s': %v. Falling back to OpenAI", model, err)
+			route = &database.ModelRoute{
+				ModelName:   model,
+				Provider:    "openai",
+				UpstreamURL: "https://api.openai.com",
+			}
+		}
+
+		// 2. Parse the upstream target URL
+		target, err := url.Parse(route.UpstreamURL)
+		if err != nil {
+			log.Printf("Failed to parse upstream URL '%s': %v", route.UpstreamURL, err)
+			return
+		}
+
+		// 3. Rewrite request host/scheme
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
-
-		// Host header
 		req.Host = target.Host
 
-		// Insert OpenAI API key
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+		// 4. Provider-specific configuration
+		if route.Provider == "ollama" {
+			req.Header.Del("Authorization")
+		} else if route.Provider == "gemini" {
+			upstreamModel := route.ModelName
+			if upstreamModel == "mixed-model" {
+				upstreamModel = "gemini-2.5-flash"
+			}
+			req.URL.Path = "/v1beta/models/" + upstreamModel + ":generateContent"
+
+			// Inject Gemini Key
+			q := req.URL.Query()
+			q.Set("key", geminiKey)
+			req.URL.RawQuery = q.Encode()
+			req.Header.Del("Authorization")
+
+			// Translate request body
+			geminiBytes, err := provider.TranslateOpenAIToGemini(bodyBytes)
+			if err == nil {
+				req.Body = io.NopCloser(bytes.NewBuffer(geminiBytes))
+				req.ContentLength = int64(len(geminiBytes))
+				req.Header.Set("Content-Length", strconv.Itoa(len(geminiBytes)))
+			}
+		} else {
+			// OpenAI Default
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
 	}
 	// Modify incoming response
 	proxy.ModifyResponse = func(resp *http.Response) error {
@@ -128,16 +214,50 @@ func newOpenAIProxy(apiKey string, db *sql.DB) (*httputil.ReverseProxy, error) {
 			return nil
 		}
 
-		// Pricing for GPT-4o Mini
-		inputCost := float64(openAIResp.Usage.PromptTokens) * 0.00000015
-		outputCost := float64(openAIResp.Usage.CompletionTokens) * 0.00000060
-
-		totalCost := inputCost + outputCost
-
-
+		// 1. Detect if this was a Gemini request by inspecting the URL Path
+		isGemini := strings.Contains(resp.Request.URL.Path, "generateContent")
+		
+		var promptTokens, completionTokens int
+		var totalCost float64
+		if isGemini {
+			// 2. Translate Gemini JSON response to OpenAI JSON response
+			translatedBytes, err := provider.TranslateGeminiToOpenAI(bodyBytes)
+			if err != nil {
+				log.Printf("Failed to translate Gemini response: %v", err)
+				return err
+			}
+			// 3. Replace response body and update headers
+			resp.Body.Close()
+			resp.Body = io.NopCloser(bytes.NewBuffer(translatedBytes))
+			resp.ContentLength = int64(len(translatedBytes))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(translatedBytes)))
+			// 4. Decode the translated response to extract token usage for billing
+			var openAIResp OpenAIResponse
+			json.Unmarshal(translatedBytes, &openAIResp)
+			promptTokens = openAIResp.Usage.PromptTokens
+			completionTokens = openAIResp.Usage.CompletionTokens
+		} else {
+			// Standard OpenAI/Ollama parsing
+			var openAIResp OpenAIResponse
+			json.Unmarshal(bodyBytes, &openAIResp)
+			promptTokens = openAIResp.Usage.PromptTokens
+			completionTokens = openAIResp.Usage.CompletionTokens
+		}
+		
+		// 5. Calculate Cost based on routed provider/host
+		if isGemini {
+			// Gemini pricing (e.g. $0.075 per 1M input, $0.30 per 1M output)
+			totalCost = (float64(promptTokens) * 0.000000075) + (float64(completionTokens) * 0.00000030)
+		} else if strings.Contains(resp.Request.URL.Host, "host.docker.internal") {
+			// Ollama requests are self-hosted (free)
+			totalCost = 0.0
+		} else {
+			// OpenAI pricing
+			totalCost = (float64(promptTokens) * 0.00000015) + (float64(completionTokens) * 0.00000060)
+		}
+		// 6. Update database spend
 		if totalCost > 0 {
-
-			err := database.UpdateKeySpend(db,virtualKey,totalCost)
+			err := database.UpdateKeySpend(db, virtualKey, totalCost)
 			if err != nil {
 				log.Printf("Failed to update spend: %v", err)
 			}
@@ -155,6 +275,7 @@ func main() {
     	log.Fatalf("Error loading .env file: %v", err)
 	}
 	apiKey := os.Getenv("OPENAI_API_KEY")
+	geminiKey := os.Getenv("GEMINI_API_KEY")
 
 	if apiKey == "" {
 		log.Fatal("OPENAI_API_KEY not found")
@@ -174,7 +295,7 @@ func main() {
 	}
 	defer rdb.Close()
 	// Create proxy
-	proxy, err := newOpenAIProxy(apiKey, db)
+	proxy, err := newDynamicProxy(apiKey,geminiKey, db)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -194,4 +315,92 @@ func main() {
 	log.Println("Proxy running on :8080")
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+// AegisTransport implements http.RoundTripper and handles automatic failover/retries
+type AegisTransport struct {
+	db        *sql.DB
+	apiKey    string
+	geminiKey string
+	transport http.RoundTripper
+}
+
+func (t *AegisTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// 1. Keep track of the original request context
+	originalCtx := req.Context()
+
+	// 2. Execute the primary request
+	resp, err := t.transport.RoundTrip(req)
+
+	// 3. Check if we need to failover (network errors, HTTP 429, or HTTP 5xx errors)
+	shouldFailover := (err != nil) || (resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500))
+
+	if shouldFailover {
+		// Retrieve the original body bytes we stored in the context
+		originalBody, ok := originalCtx.Value(OriginalBodyKey).([]byte)
+		if ok && len(originalBody) > 0 {
+			var reqModel RequestModel
+			if json.Unmarshal(originalBody, &reqModel) == nil && reqModel.Model != "" {
+				// Query DB to see if the primary route defines a fallback model
+				route, routeErr := database.GetModelRoute(t.db, reqModel.Model)
+				if routeErr == nil && route.FallbackModel.Valid && route.FallbackModel.String != "" {
+					fallbackModel := route.FallbackModel.String
+					log.Printf("Primary request failed (err: %v). Attempting failover to fallback model: %s", err, fallbackModel)
+
+					// Look up the fallback route details
+					fallbackRoute, fbErr := database.GetModelRoute(t.db, fallbackModel)
+					if fbErr == nil {
+						// Create a new request using the original body
+						fallbackReq, reqErr := http.NewRequestWithContext(originalCtx, "POST", fallbackRoute.UpstreamURL, bytes.NewBuffer(originalBody))
+						if reqErr == nil {
+							// Copy original headers
+							for k, vv := range req.Header {
+								for _, v := range vv {
+									fallbackReq.Header.Add(k, v)
+								}
+							}
+
+							target, _ := url.Parse(fallbackRoute.UpstreamURL)
+							fallbackReq.URL.Scheme = target.Scheme
+							fallbackReq.URL.Host = target.Host
+							fallbackReq.Host = target.Host
+
+							// Route fallback payload
+							if fallbackRoute.Provider == "ollama" {
+								fallbackReq.Header.Del("Authorization")
+							} else if fallbackRoute.Provider == "gemini" {
+								fallbackReq.URL.Path = "/v1beta/models/" + fallbackRoute.ModelName + ":generateContent"
+								q := fallbackReq.URL.Query()
+								q.Set("key", t.geminiKey)
+								fallbackReq.URL.RawQuery = q.Encode()
+								fallbackReq.Header.Del("Authorization")
+
+								geminiBytes, transErr := provider.TranslateOpenAIToGemini(originalBody)
+								if transErr == nil {
+									fallbackReq.Body = io.NopCloser(bytes.NewBuffer(geminiBytes))
+									fallbackReq.ContentLength = int64(len(geminiBytes))
+									fallbackReq.Header.Set("Content-Length", strconv.Itoa(len(geminiBytes)))
+								}
+							} else {
+								// OpenAI
+								fallbackReq.Header.Set("Authorization", "Bearer "+t.apiKey)
+							}
+
+							// Execute the fallback request
+							fbResp, fbErr := t.transport.RoundTrip(fallbackReq)
+							if fbErr == nil {
+								if resp != nil {
+									resp.Body.Close() // Close the original failed body stream
+								}
+								return fbResp, nil
+							}
+							log.Printf("Fallback to %s also failed: %v", fallbackModel, fbErr)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return resp, err
 }

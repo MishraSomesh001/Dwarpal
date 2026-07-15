@@ -1,0 +1,4 @@
+{
+  "model": "mixed-model",
+  "messages": [{"role": "user", "content": "Say hello in one word!"}]
+}

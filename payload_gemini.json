@@ -1,0 +1,4 @@
+{
+  "model": "gemini-2.5-flash",
+  "messages": [{"role": "user", "content": "Say hello in one word!"}]
+}

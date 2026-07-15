@@ -10,6 +10,8 @@ services:
     depends_on:
       - postgres
       - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # Maps host IP to hostname inside the container
 
   postgres:
     image: postgres:16-alpine
