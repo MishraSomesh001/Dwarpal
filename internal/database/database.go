@@ -120,6 +120,14 @@ func InitDB() (*sql.DB, error) {
 	// 	return nil, err
 	// }
 
+	// Acquire exclusive advisory lock so only one replica runs schema migration at a time.
+	// The other replicas block here (not crash!) until the lock is released.
+	// 12345 is our application's unique lock ID.
+	if _, err := db.Exec("SELECT pg_advisory_lock(12345)"); err != nil {
+		return nil, fmt.Errorf("could not acquire advisory lock: %w", err)
+	}
+	defer db.Exec("SELECT pg_advisory_unlock(12345)")
+
 	tenantTable := `
 	CREATE TABLE IF NOT EXISTS tenants (
 		id SERIAL PRIMARY KEY,
@@ -138,7 +146,7 @@ func InitDB() (*sql.DB, error) {
 		spend_usd NUMERIC(10, 4) DEFAULT 0.00
 	);
 	`
-	model_routes:=`
+	model_routes := `
 	CREATE TABLE IF NOT EXISTS model_routes (
 		id SERIAL PRIMARY KEY,
 		model_name TEXT NOT NULL,
@@ -152,7 +160,6 @@ func InitDB() (*sql.DB, error) {
 	if _, err := db.Exec(tenantTable); err != nil {
 		return nil, err
 	}
-
 	if _, err := db.Exec(keyTable); err != nil {
 		return nil, err
 	}
@@ -160,58 +167,47 @@ func InitDB() (*sql.DB, error) {
 		return nil, err
 	}
 
-	var count int
-
-	err = db.QueryRow("SELECT COUNT(*) FROM tenants").Scan(&count)
+	// Seed data using ON CONFLICT DO NOTHING - safe to run from all 3 replicas concurrently
+	_, err = db.Exec(`
+		INSERT INTO tenants(name) VALUES('Default Tenant') ON CONFLICT DO NOTHING
+	`)
 	if err != nil {
 		return nil, err
 	}
 
-	if count == 0 {
-		var tenantID int
-		err = db.QueryRow(
-			"INSERT INTO tenants(name) VALUES($1) RETURNING id",
-			"Default Tenant",
-		).Scan(&tenantID)
+	var tenantID int
+	err = db.QueryRow("SELECT id FROM tenants WHERE name = 'Default Tenant'").Scan(&tenantID)
+	if err != nil {
+		return nil, err
+	}
 
-		if err != nil {
-			return nil, err
-		}
+	hashedKey := HashKey("vk-testkey123")
+	_, err = db.Exec(
+		`INSERT INTO virtual_keys (tenant_id, key_hash, is_active, expires_at, budget_usd, spend_usd)
+		 VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (key_hash) DO NOTHING`,
+		tenantID,
+		hashedKey,
+		true,
+		time.Now().Add(365*24*time.Hour),
+		10.00,
+		0.00,
+	)
+	if err != nil {
+		return nil, err
+	}
 
-		hashedKey := HashKey("vk-testkey123")
-
-		_, err = db.Exec(
-			`INSERT INTO virtual_keys
-			(tenant_id, key_hash, is_active, expires_at, budget_usd, spend_usd)
-			VALUES($1,$2,$3,$4,$5,$6)`,
-			tenantID,
-			hashedKey,
-			true,
-			time.Now().Add(365*24*time.Hour),
-			10.00, // Budget
-			0.00,  // Start Spend at 0
-		)
-
-		if err != nil {
-			return nil, err
-		}
-		var routeCount int
-		err = db.QueryRow("SELECT COUNT(*) FROM model_routes").Scan(&routeCount)
-		if err == nil && routeCount == 0 {
-			_, err = db.Exec(`
-				INSERT INTO model_routes (model_name, provider, upstream_url, weight, fallback_model)
-				VALUES 
-				('qwen2.5:7b', 'ollama', 'http://host.docker.internal:11434', 1.00, NULL),
-				('gemini-2.5-flash', 'gemini', 'https://generativelanguage.googleapis.com', 1.00, 'gpt-4o-mini'),
-				('gpt-4o-mini', 'openai', 'https://api.openai.com', 1.00, NULL),
-				-- Load balancing split: 50% OpenAI, 50% Gemini
-				('mixed-model', 'openai', 'https://api.openai.com', 0.50, NULL),
-				('mixed-model', 'gemini', 'https://generativelanguage.googleapis.com', 0.50, NULL)
-			`)
-			if err != nil {
-				return nil, err
-			}
-		}
+	_, err = db.Exec(`
+		INSERT INTO model_routes (model_name, provider, upstream_url, weight, fallback_model)
+		VALUES 
+		('qwen2.5:7b',      'ollama',  'http://host.docker.internal:11434',         1.00, NULL),
+		('gemini-2.5-flash','gemini',  'https://generativelanguage.googleapis.com',  1.00, 'gpt-4o-mini'),
+		('gpt-4o-mini',     'openai',  'https://api.openai.com',                    1.00, NULL),
+		('mixed-model',     'openai',  'https://api.openai.com',                    0.50, NULL),
+		('mixed-model',     'gemini',  'https://generativelanguage.googleapis.com',  0.50, NULL)
+		ON CONFLICT DO NOTHING
+	`)
+	if err != nil {
+		return nil, err
 	}
 
 	return db, nil

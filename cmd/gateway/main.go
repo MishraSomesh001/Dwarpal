@@ -21,6 +21,8 @@ import (
 	"context"
 )
 
+const ProviderCtxKey contextKey="provider_name"
+
 // OpenAI Response Struct
 type OpenAIResponse struct {
 	Usage struct {
@@ -107,7 +109,12 @@ func newDynamicProxy(apiKey string, geminiKey string, db *sql.DB) (*httputil.Rev
 
 	// Parse target URL
 	openAITarget, _ := url.Parse("https://api.openai.com")
-
+	// Breakers map
+	breakers:= map[string]*provider.CircuitBreaker{
+			"openai": provider.NewCircuitBreaker(5, 30*time.Second),
+			"gemini": provider.NewCircuitBreaker(5, 30*time.Second),
+			"ollama": provider.NewCircuitBreaker(5, 30*time.Second),
+		}
 	// proxy
 	proxy := httputil.NewSingleHostReverseProxy(openAITarget)
 
@@ -117,6 +124,7 @@ func newDynamicProxy(apiKey string, geminiKey string, db *sql.DB) (*httputil.Rev
 		apiKey:    apiKey,
 		geminiKey: geminiKey,
 		transport: http.DefaultTransport,
+		breakers: breakers,
 	}
 
 	// Modify Request
@@ -126,6 +134,7 @@ func newDynamicProxy(apiKey string, geminiKey string, db *sql.DB) (*httputil.Rev
 			log.Printf("Failed to peek model: %v", err)
 			return
 		}
+		
 
 		// Save the original body in the request context so our Transport can access it if it needs to failover
 		ctx := context.WithValue(req.Context(), OriginalBodyKey, bodyBytes)
@@ -141,7 +150,20 @@ func newDynamicProxy(apiKey string, geminiKey string, db *sql.DB) (*httputil.Rev
 				UpstreamURL: "https://api.openai.com",
 			}
 		}
-
+		if cb, ok := breakers[route.Provider]; ok && !cb.AllowRequest() {
+			if route.FallbackModel.Valid && route.FallbackModel.String != "" {
+				fallbackModel := route.FallbackModel.String
+				log.Printf("[BREAKER] Circuit for provider '%s' is OPEN. Bypassing to fallback model '%s'", route.Provider, fallbackModel)
+				
+				// Overwrite route with the fallback model's route
+				fbRoute, fbErr := database.GetModelRoute(db, fallbackModel)
+				if fbErr == nil {
+					route = fbRoute
+				}
+			}
+		}
+		ctx = context.WithValue(ctx, ProviderCtxKey, route.Provider) // Save provider name
+		*req = *req.WithContext(ctx)
 		// 2. Parse the upstream target URL
 		target, err := url.Parse(route.UpstreamURL)
 		if err != nil {
@@ -304,7 +326,7 @@ func main() {
 		proxy.ServeHTTP(w, r)
 	})
 	//Rate Limithandler
-	limiter:= middleware.RateLimitMiddleware(rdb,5,1*time.Minute)
+	limiter:= middleware.RateLimitMiddleware(rdb,20,1*time.Minute)
 	rateLimitedHandler := limiter(proxyHandler)
 
 	// Auth Handler
@@ -323,19 +345,32 @@ type AegisTransport struct {
 	apiKey    string
 	geminiKey string
 	transport http.RoundTripper
+	breakers map[string]*provider.CircuitBreaker
 }
 
 func (t *AegisTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// 1. Keep track of the original request context
 	originalCtx := req.Context()
+	providerName, _ := originalCtx.Value(ProviderCtxKey).(string)
+	cb := t.breakers[providerName]
+	
 
 	// 2. Execute the primary request
 	resp, err := t.transport.RoundTrip(req)
 
-	// 3. Check if we need to failover (network errors, HTTP 429, or HTTP 5xx errors)
-	shouldFailover := (err != nil) || (resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500))
+	// Check for failures
+	isFailure := (err != nil) || (resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500))
+	
+	if cb != nil {
+		if isFailure {
+			cb.RecordFailure()
+			log.Printf("[BREAKER] Recorded failure for provider '%s'. State: %s", providerName, cb.State())
+		} else {
+			cb.RecordSuccess()
+		}
+	}
 
-	if shouldFailover {
+	if isFailure {
 		// Retrieve the original body bytes we stored in the context
 		originalBody, ok := originalCtx.Value(OriginalBodyKey).([]byte)
 		if ok && len(originalBody) > 0 {

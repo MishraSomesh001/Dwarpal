@@ -1,17 +1,46 @@
 version: '3.8'
 
 services:
-  gateway:
+  gateway-1:
     build: .
-    ports:
-      - "8080:8080"
     env_file:
       - .env
     depends_on:
       - postgres
       - redis
     extra_hosts:
-      - "host.docker.internal:host-gateway" # Maps host IP to hostname inside the container
+      - "host.docker.internal:host-gateway"
+
+  gateway-2:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  gateway-3:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - gateway-1
+      - gateway-2
+      - gateway-3
 
   postgres:
     image: postgres:16-alpine
@@ -33,7 +62,6 @@ services:
     command: redis-server --requirepass ${REDIS_PASSWORD}
     volumes:
       - redis_data:/data
-
 
 volumes:
   postgres_data:
