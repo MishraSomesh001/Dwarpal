@@ -1,27 +1,33 @@
 package main
 
 import (
+	"aegis/internal/api"
+	"aegis/internal/cache"
 	"aegis/internal/database"
+	"aegis/internal/guardrails"
+	"aegis/internal/metrics"
 	"aegis/internal/middleware"
+	"aegis/internal/provider"
 	"bufio"
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"strings"
-	"aegis/internal/cache"
-	"time"
-	"bytes"
-	"encoding/json"
-	"io"
-	"database/sql"
-	"aegis/internal/provider"
 	"strconv"
-	"context"
+	"strings"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-const ProviderCtxKey contextKey="provider_name"
+const ProviderCtxKey contextKey = "provider_name"
+const IsStreamingKey contextKey = "is_streaming"
 
 // OpenAI Response Struct
 type OpenAIResponse struct {
@@ -36,7 +42,8 @@ const OriginalBodyKey contextKey = "original_body"
 
 // Model struct
 type RequestModel struct {
-	Model string `json:"model"`
+	Model  string `json:"model"`
+	Stream bool   `json:"stream"`
 }
 
 // Load env
@@ -84,14 +91,14 @@ func loadEnv(filepath string) (error){
 	
 }
 
-func peekModel(req *http.Request) (string, []byte, error) {
+func peekModel(req *http.Request) (string, []byte, bool, error) {
 	if req.Body == nil {
-		return "", nil, nil
+		return "", nil, false, nil
 	}
 
 	bodyBytes, err := io.ReadAll(req.Body)
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 
 	req.Body.Close()
@@ -99,9 +106,9 @@ func peekModel(req *http.Request) (string, []byte, error) {
 
 	var reqModel RequestModel
 	if err := json.Unmarshal(bodyBytes, &reqModel); err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
-	return reqModel.Model, bodyBytes, nil
+	return reqModel.Model, bodyBytes, reqModel.Stream, nil
 }
 
 // reverse proxy -> OpenAI
@@ -129,15 +136,19 @@ func newDynamicProxy(apiKey string, geminiKey string, db *sql.DB) (*httputil.Rev
 
 	// Modify Request
 	proxy.Director = func(req *http.Request) {
-		model, bodyBytes, err := peekModel(req)
+		model, bodyBytes, isStreaming, err := peekModel(req)
 		if err != nil {
 			log.Printf("Failed to peek model: %v", err)
 			return
 		}
-		
 
-		// Save the original body in the request context so our Transport can access it if it needs to failover
+		// Apply PII guardrails — mask sensitive data before sending to LLM
+		bodyBytes = guardrails.MaskJSONBody(bodyBytes)
+		req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		// Save original body + streaming flag in context
 		ctx := context.WithValue(req.Context(), OriginalBodyKey, bodyBytes)
+		ctx = context.WithValue(ctx, IsStreamingKey, isStreaming)
 		*req = *req.WithContext(ctx)
 
 		// 1. Look up route in PostgreSQL
@@ -184,7 +195,12 @@ func newDynamicProxy(apiKey string, geminiKey string, db *sql.DB) (*httputil.Rev
 			if upstreamModel == "mixed-model" {
 				upstreamModel = "gemini-2.5-flash"
 			}
-			req.URL.Path = "/v1beta/models/" + upstreamModel + ":generateContent"
+			// Use streaming endpoint when client requests stream:true
+			geminiEndpoint := "generateContent"
+			if isStreaming {
+				geminiEndpoint = "streamGenerateContent"
+			}
+			req.URL.Path = "/v1beta/models/" + upstreamModel + ":" + geminiEndpoint
 
 			// Inject Gemini Key
 			q := req.URL.Query()
@@ -206,6 +222,10 @@ func newDynamicProxy(apiKey string, geminiKey string, db *sql.DB) (*httputil.Rev
 	}
 	// Modify incoming response
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		// For streaming requests, pass raw SSE bytes directly to client — do not buffer!
+		if isStreaming, ok := resp.Request.Context().Value(IsStreamingKey).(bool); ok && isStreaming {
+			return nil
+		}
 
 		if resp.StatusCode != http.StatusOK {
 			return nil
@@ -334,8 +354,115 @@ func main() {
 
 	http.Handle("/v1/", authedHandler)
 
-	log.Println("Proxy running on :8080")
+	// --- Health & Readiness Endpoints ---
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		dbOK := db.Ping() == nil
+		redisOK := rdb.Ping(r.Context()).Err() == nil
+		status := "ok"
+		code := http.StatusOK
+		if !dbOK || !redisOK {
+			status = "degraded"
+			code = http.StatusServiceUnavailable
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": status,
+			"db":     map[string]bool{"connected": dbOK},
+			"redis":  map[string]bool{"connected": redisOK},
+		})
+	})
 
+	// --- REST API Routes ---
+	// Auth (public)
+	http.HandleFunc("/api/auth/login", api.HandleLogin(db))
+
+	// Admin routes — JWT required + admin role
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("/api/admin/keys", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodOptions {
+			api.CORSHandler(w, r); return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			api.HandleAdminGetKeys(db)(w, r)
+		case http.MethodPost:
+			api.HandleAdminCreateKey(db)(w, r)
+		case http.MethodDelete:
+			api.HandleAdminRevokeKey(db)(w, r)
+		}
+	})
+	adminMux.HandleFunc("/api/admin/users", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodOptions {
+			api.CORSHandler(w, r); return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			api.HandleAdminGetUsers(db)(w, r)
+		case http.MethodPost:
+			api.HandleAdminCreateUser(db)(w, r)
+		}
+	})
+	adminMux.HandleFunc("/api/admin/providers", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodOptions {
+			api.CORSHandler(w, r); return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			api.HandleAdminGetProviders(db)(w, r)
+		case http.MethodPost:
+			api.HandleAdminUpsertProvider(db)(w, r)
+		}
+	})
+	adminMux.HandleFunc("/api/admin/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodOptions {
+			api.CORSHandler(w, r); return
+		}
+		api.HandleAdminGetLogs(db)(w, r)
+	})
+	adminMux.HandleFunc("/api/admin/alerts", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodOptions {
+			api.CORSHandler(w, r); return
+		}
+		api.HandleAdminGetAlerts(db)(w, r)
+	})
+	http.Handle("/api/admin/", middleware.JWTMiddleware(middleware.AdminOnly(adminMux)))
+
+	// Employee routes — JWT required
+	employeeMux := http.NewServeMux()
+	employeeMux.HandleFunc("/api/employee/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodOptions {
+			api.CORSHandler(w, r); return
+		}
+		api.HandleEmployeeDashboard(db)(w, r)
+	})
+	employeeMux.HandleFunc("/api/employee/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodOptions {
+			api.CORSHandler(w, r); return
+		}
+		api.HandleEmployeeLogs(db)(w, r)
+	})
+	http.Handle("/api/employee/", middleware.JWTMiddleware(employeeMux))
+
+	// Expose Prometheus metrics on a separate port
+	go func() {
+		metricsServeMux := http.NewServeMux()
+		metricsServeMux.Handle("/metrics", promhttp.Handler())
+		log.Println("Metrics server running on :9090")
+		if err := http.ListenAndServe(":9090", metricsServeMux); err != nil {
+			log.Printf("Metrics server error: %v", err)
+		}
+	}()
+
+	log.Println("Proxy running on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -353,22 +480,61 @@ func (t *AegisTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	originalCtx := req.Context()
 	providerName, _ := originalCtx.Value(ProviderCtxKey).(string)
 	cb := t.breakers[providerName]
-	
+
+	// Extract model name for metrics labels
+	var modelName string
+	if originalBody, ok := originalCtx.Value(OriginalBodyKey).([]byte); ok {
+		var rm RequestModel
+		if json.Unmarshal(originalBody, &rm) == nil {
+			modelName = rm.Model
+		}
+	}
+
+	// Start latency timer
+	start := time.Now()
 
 	// 2. Execute the primary request
 	resp, err := t.transport.RoundTrip(req)
 
+	// Record request duration regardless of outcome
+	if providerName != "" {
+		metrics.RequestDuration.WithLabelValues(providerName).Observe(time.Since(start).Seconds())
+	}
+
 	// Check for failures
 	isFailure := (err != nil) || (resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500))
-	
+
 	if cb != nil {
 		if isFailure {
 			cb.RecordFailure()
 			log.Printf("[BREAKER] Recorded failure for provider '%s'. State: %s", providerName, cb.State())
+			// Update circuit breaker gauge
+			if cb.State() == "OPEN" {
+				metrics.CircuitBreakerOpen.WithLabelValues(providerName).Set(1)
+			}
 		} else {
 			cb.RecordSuccess()
+			metrics.CircuitBreakerOpen.WithLabelValues(providerName).Set(0)
 		}
 	}
+
+	// Record request outcome
+	if providerName != "" && modelName != "" {
+		if isFailure {
+			metrics.RequestsTotal.WithLabelValues(providerName, modelName, "error").Inc()
+		} else {
+			metrics.RequestsTotal.WithLabelValues(providerName, modelName, "success").Inc()
+		}
+	}
+
+	// Audit log — fire and forget (non-blocking goroutine inside LogRequest)
+	virtualKey, _ := originalCtx.Value(middleware.VirtualKeyCtxKey).(string)
+	latencyMS := int(time.Since(start).Milliseconds())
+	status := "success"
+	if isFailure {
+		status = "error"
+	}
+	database.LogRequest(t.db, virtualKey, modelName, providerName, 0, 0, latencyMS, 0, status)
 
 	if isFailure {
 		// Retrieve the original body bytes we stored in the context
@@ -378,10 +544,11 @@ func (t *AegisTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			if json.Unmarshal(originalBody, &reqModel) == nil && reqModel.Model != "" {
 				// Query DB to see if the primary route defines a fallback model
 				route, routeErr := database.GetModelRoute(t.db, reqModel.Model)
-				if routeErr == nil && route.FallbackModel.Valid && route.FallbackModel.String != "" {
-					fallbackModel := route.FallbackModel.String
-					log.Printf("Primary request failed (err: %v). Attempting failover to fallback model: %s", err, fallbackModel)
-
+					if routeErr == nil && route.FallbackModel.Valid && route.FallbackModel.String != "" {
+						fallbackModel := route.FallbackModel.String
+						log.Printf("Primary request failed (err: %v). Attempting failover to fallback model: %s", err, fallbackModel)
+						// Record failover event in metrics
+						metrics.FailoverTotal.WithLabelValues(providerName, fallbackModel).Inc()
 					// Look up the fallback route details
 					fallbackRoute, fbErr := database.GetModelRoute(t.db, fallbackModel)
 					if fbErr == nil {
